@@ -74,15 +74,6 @@ Then open `http://localhost:8080` in your browser.
 
 ---
 
-## 🌐 Free Hosting Deployment (GitHub Pages)
-
-1. Commit and push the project files to a GitHub repository.
-2. Go to **Settings > Pages** in your GitHub repository.
-3. Set the source branch to `main` and root directory `/`.
-4. Your application will be live at `https://<your-username>.github.io/<repo-name>/` with **zero hosting costs**!
-
----
-
 ## 📜 License & Credits
 
 * Licensed under the [MIT License](LICENSE).
