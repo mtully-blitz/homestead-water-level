@@ -36,52 +36,105 @@ export function setSimulatedStage(value) {
 }
 
 /**
- * Fetch and parse all live status datasets (Stage, Flashers, Battery, Rain)
+ * Helper to fetch via CORS proxy with timeout & error logging
+ */
+async function fetchProxied(url) {
+  const proxiedUrl = CORS_PROXY + encodeURIComponent(url);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+  try {
+    const res = await fetch(proxiedUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
+    const text = await res.text();
+    if (!text || text.includes('not allowed by policy')) {
+      throw new Error('Proxy response blocked or empty');
+    }
+    return text;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    console.error(`Fetch error for ${url}:`, err.message);
+    throw err;
+  }
+}
+
+/**
+ * Fetch live crossing status with resilient Promise.allSettled
  */
 export async function fetchLiveCrossingStatus() {
   try {
-    const [wlXmlText, flasherXmlText, battXmlText, rainXmlText] = await Promise.all([
+    const results = await Promise.allSettled([
       fetchProxied(`${BASE_URL_BEECAVE}beecavewl.xml`),
       fetchProxied(`${BASE_URL_BEECAVE}beecaveflasher.xml`),
       fetchProxied(`${BASE_URL_BEECAVE}beecavebatt.xml`),
       fetchProxied(`${BASE_URL_BEECAVE}beecaverain.xml`),
     ]);
 
-    const wlDoc = parseXml(wlXmlText);
+    const wlResult = results[0];
+    const flasherResult = results[1];
+    const battResult = results[2];
+    const rainResult = results[3];
+
+    // If main Water Level XML failed, trigger fallback preview data
+    if (wlResult.status === 'rejected') {
+      console.warn('Main water level feed failed:', wlResult.reason);
+      return getFallbackLiveStatus();
+    }
+
+    // 1. Parse Water Level XML
+    const wlDoc = parseXml(wlResult.value);
     const wlElem = Array.from(wlDoc.getElementsByTagName('gage_wl')).find(
       el => el.getAttribute('id') === SENSOR_IDS.STAGE_GD
     ) || wlDoc.getElementsByTagName('gage_wl')[0];
 
-    // Stage override if SIMULATED_STAGE is active
     let stage = SIMULATED_STAGE !== null ? SIMULATED_STAGE : parseFloat(wlElem?.getAttribute('stage') || '0.06');
     let flow = SIMULATED_STAGE !== null ? (stage >= THRESHOLDS.ROAD_DECK ? 28.4 : 0.0) : parseFloat(wlElem?.getAttribute('flow') || '0');
     const lastRpt = wlElem?.getAttribute('last_rpt') || new Date().toISOString();
 
-    const flasherDoc = parseXml(flasherXmlText);
-    const flashers = Array.from(flasherDoc.getElementsByTagName('gage_flasher'));
-    const masterFlasher = flashers.find(el => el.getAttribute('id') === SENSOR_IDS.FLASHER_MASTER);
-    const flasher1 = flashers.find(el => el.getAttribute('id') === SENSOR_IDS.FLASHER_1);
+    // 2. Parse Flasher XML
+    let masterStatus = 'Off';
+    let flasher1Status = 'Off';
+    let flasherActive = false;
 
-    const masterStatus = SIMULATED_STAGE !== null && SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? 'On' : (masterFlasher?.getAttribute('status') || 'Off');
-    const flasher1Status = SIMULATED_STAGE !== null && SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? 'On' : (flasher1?.getAttribute('status') || 'Off');
-    const flasherActive = masterStatus !== 'Off' || flasher1Status !== 'Off';
+    if (flasherResult.status === 'fulfilled') {
+      const flasherDoc = parseXml(flasherResult.value);
+      const flashers = Array.from(flasherDoc.getElementsByTagName('gage_flasher'));
+      const masterFlasher = flashers.find(el => el.getAttribute('id') === SENSOR_IDS.FLASHER_MASTER);
+      const flasher1 = flashers.find(el => el.getAttribute('id') === SENSOR_IDS.FLASHER_1);
 
-    const battDoc = parseXml(battXmlText);
-    const batts = Array.from(battDoc.getElementsByTagName('gage_batt'));
-    const masterBatt = batts.find(el => el.getAttribute('id') === SENSOR_IDS.BATT_MASTER);
-    const flasherBatt = batts.find(el => el.getAttribute('id') === SENSOR_IDS.BATT_FLASHER);
+      masterStatus = SIMULATED_STAGE !== null && SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? 'On' : (masterFlasher?.getAttribute('status') || 'Off');
+      flasher1Status = SIMULATED_STAGE !== null && SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? 'On' : (flasher1?.getAttribute('status') || 'Off');
+      flasherActive = masterStatus !== 'Off' || flasher1Status !== 'Off';
+    }
 
-    const masterBattVolts = parseFloat(masterBatt?.getAttribute('battery') || '12.70');
-    const flasherBattVolts = parseFloat(flasherBatt?.getAttribute('battery') || '12.96');
+    // 3. Parse Battery XML
+    let masterBattVolts = 12.70;
+    let flasherBattVolts = 12.96;
 
-    const rainDoc = parseXml(rainXmlText);
-    const rainElem = rainDoc.getElementsByTagName('gage_rain')[0];
-    const rainData = {
-      min15: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '0.45' : '0.00') : (rainElem?.getAttribute('min_15') || '0.00'),
-      hour1: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '1.20' : '0.00') : (rainElem?.getAttribute('hour_1') || '0.00'),
-      hour24: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '3.85' : '0.00') : (rainElem?.getAttribute('hour_24') || '0.00'),
-      day7: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '4.10' : '0.00') : (rainElem?.getAttribute('day_7') || '0.00'),
-    };
+    if (battResult.status === 'fulfilled') {
+      const battDoc = parseXml(battResult.value);
+      const batts = Array.from(battDoc.getElementsByTagName('gage_batt'));
+      const masterBatt = batts.find(el => el.getAttribute('id') === SENSOR_IDS.BATT_MASTER);
+      const flasherBatt = batts.find(el => el.getAttribute('id') === SENSOR_IDS.BATT_FLASHER);
+
+      masterBattVolts = parseFloat(masterBatt?.getAttribute('battery') || '12.70');
+      flasherBattVolts = parseFloat(flasherBatt?.getAttribute('battery') || '12.96');
+    }
+
+    // 4. Parse Rain XML
+    let rainData = { min15: '0.00', hour1: '0.00', hour24: '0.00', day7: '0.00' };
+
+    if (rainResult.status === 'fulfilled') {
+      const rainDoc = parseXml(rainResult.value);
+      const rainElem = rainDoc.getElementsByTagName('gage_rain')[0];
+      rainData = {
+        min15: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '0.45' : '0.00') : (rainElem?.getAttribute('min_15') || '0.00'),
+        hour1: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '1.20' : '0.00') : (rainElem?.getAttribute('hour_1') || '0.00'),
+        hour24: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '3.85' : '0.00') : (rainElem?.getAttribute('hour_24') || '0.00'),
+        day7: SIMULATED_STAGE !== null ? (SIMULATED_STAGE >= THRESHOLDS.ROAD_DECK ? '4.10' : '0.00') : (rainElem?.getAttribute('day_7') || '0.00'),
+      };
+    }
 
     const clearanceToRoad = THRESHOLDS.ROAD_DECK - stage;
     let statusState = 'OPEN';
@@ -110,7 +163,9 @@ export async function fetchLiveCrossingStatus() {
       rain: rainData,
       isFallback: false,
     };
+
   } catch (err) {
+    console.error('fetchLiveCrossingStatus failed:', err);
     return getFallbackLiveStatus();
   }
 }
@@ -138,7 +193,7 @@ export async function fetchHistoricalReports(numReports = 200) {
         simReports.push({
           dateStr,
           timeStr,
-          displayTime: `${t.getMonth() + 1}/${t.getDate()} ${timeStr}`,
+          displayTime: `${dateStr.substring(0, 5)} ${timeStr.substring(0, 5)}`,
           timestamp: t.getTime(),
           stage: simStage,
           flow: (simStage * 8.5).toFixed(1),
@@ -150,23 +205,8 @@ export async function fetchHistoricalReports(numReports = 200) {
 
     return reports;
   } catch (err) {
+    console.warn('fetchHistoricalReports failed, using fallback history:', err.message);
     return getFallbackHistory();
-  }
-}
-
-async function fetchProxied(url) {
-  const proxiedUrl = CORS_PROXY + encodeURIComponent(url);
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12000);
-
-  try {
-    const res = await fetch(proxiedUrl, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
-  } catch (err) {
-    clearTimeout(timeoutId);
-    throw err;
   }
 }
 
